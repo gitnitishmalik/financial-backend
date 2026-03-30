@@ -1,8 +1,63 @@
-New-Item .gitignore -ItemType File -Value "venv/
+# Virtual Environment
+venv/
+env/
+.venv/
+ENV/
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
+*.pyd
+*.pyc
+*.pyz
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+
+# Environment Variables
 .env
+.env.local
+.env.production
+.env.staging
+
+# Database
 *.db
+*.sqlite
+*.sqlite3
 finanalyzer.db
-"
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Uploads (runtime files)
+uploads/
