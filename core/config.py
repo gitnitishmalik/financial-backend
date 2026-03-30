@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     #   "llama-3.1-70b-versatile"     balanced (~500 tok/s) — recommended
     #   "llama-3.3-70b-versatile"     latest 70B             — best quality
     #   "mixtral-8x7b-32768"          long context           — big documents
-    GROQ_MODEL: str = "llama-3.3-70b-versatile"
+    GROQ_MODEL: str = "llama-3.1-8b-instant"
 
     # ── Market data (Yahoo Finance is used — no key needed) ───────
     # Optional paid upgrade keys:

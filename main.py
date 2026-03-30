@@ -1,49 +1,47 @@
-import asyncio
-import uuid
 import os
 import shutil
-from pathlib import Path
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 import uvicorn
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from api.routes import router
 from core.config import settings, validate_settings
 from core.database import init_db
 
-UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR = Path(settings.UPLOAD_DIR)
 UPLOAD_DIR.mkdir(exist_ok=True)
-
-validate_settings()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # ── Validate config inside lifespan so the port is bound first ──
+    # On Render, validate_settings() at module level causes sys.exit(1)
+    # before the port is ever opened → "no open ports detected" error.
+    validate_settings()
+
     await init_db()
     print(f"\n  FinAnalyzer Pro is running")
     print(f"  LLM  : Groq / {settings.GROQ_MODEL}")
     print(f"  DB   : {settings.DATABASE_URL.split('///')[0]}")
-    print(f"  Docs : http://localhost:8000/docs\n")
+    print(f"  Docs : /docs\n")
     yield
+
+    # Cleanup on shutdown
     shutil.rmtree(UPLOAD_DIR, ignore_errors=True)
     UPLOAD_DIR.mkdir(exist_ok=True)
 
 
 def get_allowed_origins() -> list[str]:
     origins = [
-        # Local development
         "http://localhost:3000",
         "http://localhost:5173",
         "http://127.0.0.1:3000",
         "http://127.0.0.1:5173",
-        # Production frontend — hardcoded fallback
         "https://financial-analyst-ai-flax.vercel.app",
     ]
-
-    # Also support dynamic origins via environment variables
     frontend_url = os.getenv("FRONTEND_URL", "").strip()
     if frontend_url and frontend_url not in origins:
         origins.append(frontend_url)
@@ -96,13 +94,12 @@ async def health():
     }
 
 
-# Debug endpoint — remove in production if desired
 @app.get("/cors-check")
 async def cors_check():
-    return {
-        "allowed_origins": get_allowed_origins(),
-    }
+    return {"allowed_origins": get_allowed_origins()}
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    # Reads $PORT from environment — required for Render
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)

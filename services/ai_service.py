@@ -49,7 +49,7 @@ async def chat_with_documents(file_paths: List[str], message: str) -> str:
     llm = get_groq_llm()
 
     prompt = (
-        "You are FinAnalyzer AI, an expert financial analyst.\n"
+        "You are Finanace Analyst AI, an expert financial analyst.\n"
         "Answer the user's question using ONLY the document context provided.\n"
         "If the answer is not in the context, say so clearly.\n\n"
         f"Document context:\n{context}\n\n"
