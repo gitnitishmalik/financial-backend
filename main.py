@@ -34,21 +34,25 @@ async def lifespan(app: FastAPI):
 
 def get_allowed_origins() -> list[str]:
     origins = [
+        # Local development
         "http://localhost:3000",
         "http://localhost:5173",
         "http://127.0.0.1:3000",
         "http://127.0.0.1:5173",
+        # Production frontend — hardcoded fallback
+        "https://financial-analyst-ai-flax.vercel.app",
     ]
 
+    # Also support dynamic origins via environment variables
     frontend_url = os.getenv("FRONTEND_URL", "").strip()
-    if frontend_url:
+    if frontend_url and frontend_url not in origins:
         origins.append(frontend_url)
 
     extra_origins = os.getenv("EXTRA_ORIGINS", "").strip()
     if extra_origins:
         for origin in extra_origins.split(","):
             origin = origin.strip()
-            if origin:
+            if origin and origin not in origins:
                 origins.append(origin)
 
     return origins
@@ -89,6 +93,14 @@ async def health():
         "version": "2.0.0",
         "model": settings.GROQ_MODEL,
         "groq_configured": bool(settings.GROQ_API_KEY),
+    }
+
+
+# Debug endpoint — remove in production if desired
+@app.get("/cors-check")
+async def cors_check():
+    return {
+        "allowed_origins": get_allowed_origins(),
     }
 
 
