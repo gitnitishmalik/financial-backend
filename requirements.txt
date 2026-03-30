@@ -33,3 +33,5 @@ celery
 
 
 litellm
+
+sentence-transformers

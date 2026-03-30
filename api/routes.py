@@ -1,9 +1,8 @@
 import uuid
-import asyncio
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, BackgroundTasks
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -11,18 +10,19 @@ from pydantic import BaseModel
 
 from core.config import settings
 from core.database import get_db, Document, Analysis, Alert
-from services.ai_service import AnalysisService
+from services.analysis_service import AnalysisService   # ← was ai_service (bug fix)
 from services.market_service import MarketService
 from services.chat_service import ChatService
 
 router = APIRouter()
 
-UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR = Path(settings.UPLOAD_DIR)
 UPLOAD_DIR.mkdir(exist_ok=True)
 
+# One instance per process — all share the same RAG embedder
 analysis_service = AnalysisService()
-market_service = MarketService()
-chat_service = ChatService()
+market_service   = MarketService()
+chat_service     = ChatService()
 
 
 # ─────────────────────────── Documents ───────────────────────────
@@ -38,13 +38,13 @@ async def upload_documents(
         if not file.filename.lower().endswith((".pdf", ".xlsx", ".csv")):
             raise HTTPException(400, f"{file.filename}: only PDF, XLSX, CSV allowed")
 
-        doc_id = str(uuid.uuid4())
+        doc_id   = str(uuid.uuid4())
         safe_name = f"{doc_id}_{file.filename}"
         file_path = UPLOAD_DIR / safe_name
 
         content = await file.read()
         if len(content) > settings.MAX_FILE_SIZE_MB * 1024 * 1024:
-            raise HTTPException(413, f"{file.filename} exceeds {settings.MAX_FILE_SIZE_MB}MB limit")
+            raise HTTPException(413, f"{file.filename} exceeds {settings.MAX_FILE_SIZE_MB} MB limit")
 
         file_path.write_bytes(content)
 
@@ -70,12 +70,19 @@ async def list_documents(
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
-        select(Document).where(Document.user_id == user_id).order_by(Document.created_at.desc())
+        select(Document)
+        .where(Document.user_id == user_id)
+        .order_by(Document.created_at.desc())
     )
     docs = result.scalars().all()
     return {"documents": [
-        {"id": d.id, "name": d.original_name, "size": d.file_size,
-         "status": d.status, "created_at": str(d.created_at)}
+        {
+            "id": d.id,
+            "name": d.original_name,
+            "size": d.file_size,
+            "status": d.status,
+            "created_at": str(d.created_at),
+        }
         for d in docs
     ]}
 
@@ -93,7 +100,7 @@ async def delete_document(doc_id: str, db: AsyncSession = Depends(get_db)):
     return {"deleted": doc_id}
 
 
-# ─────────────────────────── Analysis ───────────────────────────
+# ─────────────────────────── Analysis ────────────────────────────
 
 class AnalysisRequest(BaseModel):
     document_ids: List[str]
@@ -110,7 +117,7 @@ async def run_analysis(req: AnalysisRequest, db: AsyncSession = Depends(get_db))
     if not docs:
         raise HTTPException(404, "No documents found")
 
-    file_paths = [d.file_path for d in docs if d.file_path]
+    file_paths     = [d.file_path for d in docs if d.file_path]
     analysis_result = await analysis_service.analyze(file_paths, req.query)
 
     record = Analysis(
@@ -127,19 +134,30 @@ async def run_analysis(req: AnalysisRequest, db: AsyncSession = Depends(get_db))
 
 
 @router.get("/analyses")
-async def list_analyses(user_id: str = "demo-user", db: AsyncSession = Depends(get_db)):
+async def list_analyses(
+    user_id: str = "demo-user",
+    db: AsyncSession = Depends(get_db),
+):
     result = await db.execute(
-        select(Analysis).where(Analysis.user_id == user_id).order_by(Analysis.created_at.desc()).limit(20)
+        select(Analysis)
+        .where(Analysis.user_id == user_id)
+        .order_by(Analysis.created_at.desc())
+        .limit(20)
     )
     analyses = result.scalars().all()
     return {"analyses": [
-        {"id": a.id, "query": a.query, "risk_score": a.risk_score,
-         "created_at": str(a.created_at), "result": a.result}
+        {
+            "id": a.id,
+            "query": a.query,
+            "risk_score": a.risk_score,
+            "created_at": str(a.created_at),
+            "result": a.result,
+        }
         for a in analyses
     ]}
 
 
-# ─────────────────────────── Chat ───────────────────────────
+# ─────────────────────────── Chat ────────────────────────────────
 
 class ChatRequest(BaseModel):
     message: str
@@ -149,26 +167,29 @@ class ChatRequest(BaseModel):
 
 @router.post("/chat")
 async def chat_with_docs(req: ChatRequest, db: AsyncSession = Depends(get_db)):
-    file_paths = []
+    file_paths: List[str] = []
     if req.document_ids:
-        result = await db.execute(select(Document).where(Document.id.in_(req.document_ids)))
+        result = await db.execute(
+            select(Document).where(Document.id.in_(req.document_ids))
+        )
         docs = result.scalars().all()
         file_paths = [d.file_path for d in docs if d.file_path]
 
     async def stream():
-        async for chunk in chat_service.stream_response(req.message, file_paths, req.session_id):
+        async for chunk in chat_service.stream_response(
+            req.message, file_paths, req.session_id
+        ):
             yield f"data: {chunk}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
-# ─────────────────────────── Market Data ───────────────────────────
+# ─────────────────────────── Market Data ─────────────────────────
 
 @router.get("/market/quote/{ticker}")
 async def get_quote(ticker: str):
-    data = await market_service.get_quote(ticker.upper())
-    return data
+    return await market_service.get_quote(ticker.upper())
 
 
 @router.get("/market/search")
@@ -179,8 +200,7 @@ async def search_ticker(q: str):
 
 @router.get("/market/history/{ticker}")
 async def get_history(ticker: str, period: str = "1mo"):
-    data = await market_service.get_history(ticker.upper(), period)
-    return data
+    return await market_service.get_history(ticker.upper(), period)
 
 
 @router.get("/market/news/{ticker}")
@@ -189,11 +209,11 @@ async def get_news(ticker: str):
     return {"news": news}
 
 
-# ─────────────────────────── Alerts ───────────────────────────
+# ─────────────────────────── Alerts ──────────────────────────────
 
 class AlertCreate(BaseModel):
     ticker: str
-    condition: str  # "above" or "below"
+    condition: str      # "above" or "below"
     threshold: float
     user_id: str = "demo-user"
 
@@ -208,12 +228,22 @@ async def create_alert(alert: AlertCreate, db: AsyncSession = Depends(get_db)):
     )
     db.add(record)
     await db.commit()
-    return {"id": record.id, "ticker": record.ticker, "condition": record.condition, "threshold": record.threshold}
+    return {
+        "id": record.id,
+        "ticker": record.ticker,
+        "condition": record.condition,
+        "threshold": record.threshold,
+    }
 
 
 @router.get("/alerts")
-async def list_alerts(user_id: str = "demo-user", db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Alert).where(Alert.user_id == user_id, Alert.active == 1))
+async def list_alerts(
+    user_id: str = "demo-user",
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Alert).where(Alert.user_id == user_id, Alert.active == 1)
+    )
     alerts = result.scalars().all()
     return {"alerts": [
         {"id": a.id, "ticker": a.ticker, "condition": a.condition, "threshold": a.threshold}
