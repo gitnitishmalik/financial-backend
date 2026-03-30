@@ -30,3 +30,6 @@ httpx
 # ── Background tasks (optional) ──────────────────────────────────
 redis
 celery
+
+
+litellm
