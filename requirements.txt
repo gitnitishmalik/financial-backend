@@ -17,6 +17,9 @@ groq
 langchain-groq
 langchain-core
 
+# ── CrewAI multi-agent ───────────────────────────────────────────
+crewai
+
 # ── Document parsing ─────────────────────────────────────────────
 pdfplumber
 openpyxl
