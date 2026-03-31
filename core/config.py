@@ -16,18 +16,10 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379"
 
     # ── Groq AI ───────────────────────────────────────────────────
-    # Get your free key at: https://console.groq.com
     GROQ_API_KEY: str = ""
-
-    # Available models — change this one line to switch:
-    #   "llama-3.1-8b-instant"        fastest  (~800 tok/s) — great for chat
-    #   "llama-3.1-70b-versatile"     balanced (~500 tok/s) — recommended
-    #   "llama-3.3-70b-versatile"     latest 70B             — best quality
-    #   "mixtral-8x7b-32768"          long context           — big documents
     GROQ_MODEL: str = "llama-3.1-8b-instant"
 
     # ── Market data (Yahoo Finance is used — no key needed) ───────
-    # Optional paid upgrade keys:
     ALPHA_VANTAGE_KEY: Optional[str] = None
     POLYGON_API_KEY: Optional[str] = None
 
@@ -49,6 +41,7 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
+
 # ── Startup validation ────────────────────────────────────────────
 def validate_settings():
     errors = []
@@ -66,4 +59,9 @@ def validate_settings():
         for e in errors:
             print(f"\n  {e}")
         print("\n" + "=" * 60 + "\n")
-        sys.exit(1)
+        # ── Raise instead of sys.exit so Render shows the full
+        #    traceback in logs rather than a silent port-bind failure
+        raise RuntimeError(
+            "FinAnalyzer startup failed due to missing configuration. "
+            "See details above."
+        )
