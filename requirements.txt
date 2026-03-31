@@ -1,37 +1,20 @@
-# ── Web Framework ────────────────────────────────────────────────
 fastapi
 uvicorn[standard]
 python-multipart
-
-# ── Data Validation ──────────────────────────────────────────────
 pydantic
 pydantic-settings
-
-# ── Database ─────────────────────────────────────────────────────
 SQLAlchemy
 aiosqlite
 asyncpg
-
-# ── Groq AI ──────────────────────────────────────────────────────
 groq
 langchain-groq
 langchain-core
-
-# ── CrewAI multi-agent ───────────────────────────────────────────
 crewai
-
-# ── Document parsing ─────────────────────────────────────────────
 pdfplumber
 openpyxl
-
-# ── HTTP client ──────────────────────────────────────────────────
 httpx
-
-# ── Background tasks (optional) ──────────────────────────────────
 redis
 celery
-
-
 litellm
-
 sentence-transformers
+numpy

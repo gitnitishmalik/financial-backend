@@ -17,19 +17,13 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ── Validate config inside lifespan so the port is bound first ──
-    # On Render, validate_settings() at module level causes sys.exit(1)
-    # before the port is ever opened → "no open ports detected" error.
     validate_settings()
-
     await init_db()
     print(f"\n  FinAnalyzer Pro is running")
     print(f"  LLM  : Groq / {settings.GROQ_MODEL}")
     print(f"  DB   : {settings.DATABASE_URL.split('///')[0]}")
     print(f"  Docs : /docs\n")
     yield
-
-    # Cleanup on shutdown
     shutil.rmtree(UPLOAD_DIR, ignore_errors=True)
     UPLOAD_DIR.mkdir(exist_ok=True)
 
@@ -100,6 +94,5 @@ async def cors_check():
 
 
 if __name__ == "__main__":
-    # Reads $PORT from environment — required for Render
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
