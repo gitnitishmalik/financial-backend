@@ -23,15 +23,18 @@ class MarketService:
                 r.raise_for_status()
                 data = r.json()
                 meta = data["chart"]["result"][0]["meta"]
+                price = meta.get("regularMarketPrice") or 0
+                prev = meta.get("chartPreviousClose") or meta.get("previousClose") or 0
+                # Only emit change / change_pct when prev is a real, positive number.
+                # Otherwise we end up dividing by 1 and reporting price*100 as the percent.
+                change = round(price - prev, 2) if prev else None
+                change_pct = round((price - prev) / prev * 100, 2) if prev else None
                 return {
                     "ticker": ticker,
-                    "price": round(meta.get("regularMarketPrice", 0), 2),
-                    "prev_close": round(meta.get("previousClose", 0), 2),
-                    "change": round(meta.get("regularMarketPrice", 0) - meta.get("previousClose", 0), 2),
-                    "change_pct": round(
-                        (meta.get("regularMarketPrice", 0) - meta.get("previousClose", 0))
-                        / max(meta.get("previousClose", 1), 1) * 100, 2
-                    ),
+                    "price": round(price, 2),
+                    "prev_close": round(prev, 2) if prev else None,
+                    "change": change,
+                    "change_pct": change_pct,
                     "volume": meta.get("regularMarketVolume", 0),
                     "market_cap": meta.get("marketCap"),
                     "currency": meta.get("currency", "USD"),
@@ -119,3 +122,44 @@ class MarketService:
     async def get_multiple_quotes(self, tickers: List[str]) -> List[Dict]:
         tasks = [self.get_quote(t) for t in tickers]
         return await asyncio.gather(*tasks)
+
+    async def get_peers(self, ticker: str) -> List[str]:
+        async with httpx.AsyncClient(timeout=10) as client:
+            try:
+                url = f"https://query2.finance.yahoo.com/v6/finance/recommendationsbysymbol/{ticker}"
+                r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+                r.raise_for_status()
+                data = r.json()
+                result = data.get("finance", {}).get("result", [])
+                if not result:
+                    return []
+                recs = result[0].get("recommendedSymbols", [])
+                return [item["symbol"] for item in recs if item.get("symbol")][:5]
+            except Exception:
+                return []
+
+    async def get_peer_comp(self, ticker: str) -> Dict[str, Any]:
+        peers = await self.get_peers(ticker)
+        if not peers:
+            return {"ticker": ticker, "peers": [], "error": "no peers returned"}
+        target_q, peer_quotes = await asyncio.gather(
+            self.get_quote(ticker),
+            self.get_multiple_quotes(peers),
+        )
+        return {
+            "ticker": ticker,
+            "target": {
+                "price": target_q.get("price"),
+                "market_cap": target_q.get("market_cap"),
+                "change_pct": target_q.get("change_pct"),
+            },
+            "peers": [
+                {
+                    "ticker": p.get("ticker"),
+                    "price": p.get("price"),
+                    "market_cap": p.get("market_cap"),
+                    "change_pct": p.get("change_pct"),
+                }
+                for p in peer_quotes if not p.get("error")
+            ],
+        }

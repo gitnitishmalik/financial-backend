@@ -3,13 +3,12 @@ analysis_service.py  –  5-Agent high-quality financial analysis pipeline
 
 Agents (sequential):
   1. Document Verifier    – validates doc is financial, extracts structure
-  2. Financial Analyst    – extracts exact metrics, flags trends
-  3. Valuation Analyst    – DCF, P/E, EV/EBITDA, sector comparables
-  4. Risk Specialist      – data-backed risks with severity scores
-  5. Investment Advisor   – decisive JSON recommendation
+  2. Financial Analyst    – extracts exact metrics, flags trends (+calculator)
+  3. Valuation Analyst    – P/E, EV/EBITDA, comparables (+live market data)
+  4. Risk Specialist      – data-backed risks (+market history + news)
+  5. Investment Advisor   – decisive JSON recommendation (synthesis only)
 
-Token budget (~12k TPM safe):
-  Each agent: ~800 in / ~400 out = ~1200 per agent × 5 = ~6000 total
+Tool access by agent — see services/tools.py for definitions.
 """
 
 from __future__ import annotations
@@ -23,10 +22,20 @@ from typing import Any, Dict, List
 
 import pdfplumber
 from crewai import Agent, Crew, LLM, Process, Task
-from crewai.tools import BaseTool
 
 from core.config import settings
+from services.market_service import MarketService
 from services.rag_service import RAGService
+from services.tools import (
+    CalculatorTool,
+    MarketHistoryTool,
+    MarketNewsTool,
+    MarketQuoteTool,
+    PeerCompTool,
+    RAGDocumentTool,
+    SQLQueryTool,
+    WebSearchTool,
+)
 
 
 # ── Document text extraction ──────────────────────────────────────────────────
@@ -71,24 +80,74 @@ def get_groq_llm() -> LLM:
     )
 
 
-# ── RAG Tool ─────────────────────────────────────────────────────────────────
+# ── chart_data normaliser ────────────────────────────────────────────────────
 
-class RAGDocumentTool(BaseTool):
-    name: str = "search_documents"
-    description: str = (
-        "Search financial documents for specific data. "
-        "Input: short keyword (e.g. 'revenue 2023', 'net income', 'P/E ratio'). "
-        "Returns the most relevant passages from uploaded documents."
-    )
-    rag: RAGService = None  # type: ignore
+def _coerce_number(v: Any) -> float | None:
+    """Pull a float out of '1,234', '$1.2B', '12.5%', etc. Returns None on failure."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
+    if not s or s.upper() in ("N/A", "NOT REPORTED", "NA", "NULL"):
+        return None
+    s = s.replace(",", "").replace("$", "").replace("%", "").strip()
+    mult = 1.0
+    if s and s[-1] in "BbTtMmKk":
+        suffix = s[-1].lower()
+        s = s[:-1].strip()
+        mult = {"k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12}[suffix]
+    try:
+        return float(s) * mult
+    except Exception:
+        return None
 
-    class Config:
-        arbitrary_types_allowed = True
 
-    def _run(self, query: str) -> str:
-        if self.rag is None:
-            return "RAG not initialised."
-        return self.rag.retrieve(query.strip(), top_k=2) or "No data found."
+_QUARTER_RE = re.compile(r"Q([1-4])\s*[/\- ]?\s*(\d{2,4})", re.IGNORECASE)
+
+
+def _period_sort_key(period: str) -> tuple:
+    """Sort 'Q1 2023', 'FY 2024', '2023' chronologically. Unknown → end."""
+    if not isinstance(period, str):
+        return (9999, 9)
+    m = _QUARTER_RE.search(period)
+    if m:
+        y = int(m.group(2))
+        if y < 100:
+            y += 2000
+        return (y, int(m.group(1)))
+    m = re.search(r"(\d{4})", period)
+    if m:
+        return (int(m.group(1)), 0)
+    return (9999, 9)
+
+
+def _clean_chart_data(rows: Any) -> List[Dict[str, Any]]:
+    if not isinstance(rows, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        period = r.get("period") or r.get("date") or r.get("label")
+        if not period:
+            continue
+        revenue = _coerce_number(r.get("revenue"))
+        net_income = _coerce_number(r.get("net_income") or r.get("netIncome") or r.get("net_profit"))
+        op_margin = _coerce_number(r.get("operating_margin") or r.get("op_margin"))
+        fcf = _coerce_number(r.get("fcf") or r.get("free_cash_flow"))
+        # Need at least one numeric to be useful
+        if all(v is None for v in (revenue, net_income, op_margin, fcf)):
+            continue
+        out.append({
+            "period": str(period).strip(),
+            "revenue": revenue,
+            "net_income": net_income,
+            "operating_margin": op_margin,
+            "fcf": fcf,
+        })
+    out.sort(key=lambda x: _period_sort_key(x["period"]))
+    return out[:20]  # cap at 20 periods so the chart stays readable
 
 
 # ── Analysis Service ──────────────────────────────────────────────────────────
@@ -97,6 +156,7 @@ class AnalysisService:
 
     def __init__(self) -> None:
         self._rag = RAGService()
+        self._market = MarketService()
 
     async def analyze(self, file_paths: List[str], query: str) -> Dict[str, Any]:
         return await asyncio.to_thread(self._run_crew, file_paths, query)
@@ -108,8 +168,15 @@ class AnalysisService:
         self._rag.ingest([t for t in raw_texts if t])
         context = self._rag.retrieve(query, top_k=2)   # ~800 words
 
-        llm      = get_groq_llm()
-        rag_tool = RAGDocumentTool(rag=self._rag)
+        llm           = get_groq_llm()
+        rag_tool      = RAGDocumentTool(rag=self._rag)
+        calc_tool     = CalculatorTool()
+        quote_tool    = MarketQuoteTool(market=self._market)
+        history_tool  = MarketHistoryTool(market=self._market)
+        news_tool     = MarketNewsTool(market=self._market)
+        peer_tool     = PeerCompTool(market=self._market)
+        web_tool      = WebSearchTool()
+        sql_tool      = SQLQueryTool()
 
         # ══════════════════════════════════════════════════════════════════════
         # AGENT 1 — Document Verifier
@@ -147,14 +214,15 @@ class AnalysisService:
                 "You are a CFA charterholder with 20 years at Goldman Sachs equity research. "
                 "You extract EXACT figures — never approximate or estimate. "
                 "For every metric you state: the number, the YoY change, and IMPROVING or DETERIORATING. "
+                "You ALWAYS use the calculator tool for percentage and ratio computations — never compute in your head. "
                 "You never use hedging words like 'may', 'could', 'might', 'potentially'. "
                 "If a metric is missing from the document, you say 'NOT REPORTED' — never guess. "
                 "You focus on: revenue, gross/operating/net margins, EPS, FCF, debt levels, "
                 "working capital, and any sector-specific KPIs present in the document."
             ),
             llm=llm,
-            tools=[rag_tool],
-            max_iter=2,
+            tools=[rag_tool, calc_tool, sql_tool],
+            max_iter=3,
             verbose=False,
             allow_delegation=False,
         )
@@ -168,6 +236,11 @@ class AnalysisService:
             goal="Determine if the stock is overvalued, fairly valued, or undervalued using hard data.",
             backstory=(
                 "You are a valuation specialist from Morgan Stanley's M&A division. "
+                "You ALWAYS pull the LIVE market price using market_quote before computing ratios — "
+                "document figures from past quarters are stale. "
+                "You use market_history to assess price trend and momentum. "
+                "You use peer_comparison to ground sector multiples in real peer data instead of guessing benchmarks. "
+                "You use the calculator tool for every P/E, EV/EBITDA, PEG, and FCF-yield computation. "
                 "You apply standard valuation frameworks to every analysis:\n"
                 "- P/E ratio vs sector average (state the sector benchmark)\n"
                 "- EV/EBITDA vs sector average\n"
@@ -179,8 +252,8 @@ class AnalysisService:
                 "You give a clear verdict: OVERVALUED / FAIRLY VALUED / UNDERVALUED with a reason."
             ),
             llm=llm,
-            tools=[rag_tool],
-            max_iter=1,
+            tools=[rag_tool, quote_tool, history_tool, peer_tool, calc_tool, sql_tool],
+            max_iter=3,
             verbose=False,
             allow_delegation=False,
         )
@@ -194,11 +267,16 @@ class AnalysisService:
             goal="Identify the top 4 material risks, each backed by a specific number.",
             backstory=(
                 "You are a former Chief Risk Officer at JP Morgan with 25 years experience. "
-                "Every risk you identify must reference a specific metric from the documents. "
+                "Every risk you identify must reference a specific metric from the documents OR live market data. "
+                "You use market_news to check for recent material events that signal risk. "
+                "You use web_search to pull recent SEC filings (10-K/10-Q/8-K) for regulatory and disclosure risk. "
+                "You use market_history to assess price volatility and momentum trends. "
+                "You use sql_query (high_risk_analyses) to learn from prior high-risk calls in the database. "
+                "You use the calculator for ratio-based risk thresholds (D/E, current ratio, etc.). "
                 "You categorise risks across four dimensions:\n"
                 "  FINANCIAL: leverage, liquidity, margin compression\n"
                 "  OPERATIONAL: volume, capacity, supply chain signals\n"
-                "  MARKET: demand trends, competitive position, pricing power\n"
+                "  MARKET: demand trends, competitive position, pricing power, volatility\n"
                 "  REGULATORY: compliance, legal, policy exposure\n"
                 "Each risk gets a severity: LOW / MEDIUM / HIGH / CRITICAL\n"
                 "BAD example: 'Market conditions may affect revenue'\n"
@@ -207,8 +285,8 @@ class AnalysisService:
                 "You give an overall portfolio risk score 1-10."
             ),
             llm=llm,
-            tools=[],
-            max_iter=1,
+            tools=[rag_tool, quote_tool, history_tool, news_tool, web_tool, calc_tool, sql_tool],
+            max_iter=3,
             verbose=False,
             allow_delegation=False,
         )
@@ -272,6 +350,8 @@ class AnalysisService:
                 "• Free cash flow\n"
                 "• Total debt, D/E ratio, current ratio\n"
                 "• Sector KPIs (units, deliveries, subscribers, etc.)\n\n"
+                "Use the calculator tool for EVERY percentage change and ratio — never compute in your head.\n"
+                "Use search_documents to find numbers not visible in the context above.\n"
                 "Label each: IMPROVING ↑ or DETERIORATING ↓ with the % change.\n"
                 "If not reported: say NOT REPORTED.\n"
                 "No hedging. Max 250 words."
@@ -287,11 +367,15 @@ class AnalysisService:
         task_value = Task(
             description=(
                 "Using the analyst's metrics, apply valuation frameworks:\n"
-                "1. P/E ratio — compare to sector average (state the benchmark used)\n"
+                "FIRST: identify the ticker mentioned in the document and call market_quote to get the LIVE price.\n"
+                "THEN: call market_history with period='1y' to assess price trend.\n"
+                "THEN: use the calculator tool for every ratio computation:\n"
+                "1. P/E ratio (live_price / EPS) — compare to sector average (state the benchmark used)\n"
                 "2. EV/EBITDA — compare to sector average\n"
                 "3. FCF yield or Price/FCF if FCF is available\n"
                 "4. PEG ratio if EPS growth is reported\n"
                 "5. Overall verdict: OVERVALUED / FAIRLY VALUED / UNDERVALUED\n\n"
+                "If no ticker is identifiable, state that and base verdict on document-only data.\n"
                 "If a metric is missing, state it and explain impact on confidence.\n"
                 "Max 150 words."
             ),
@@ -306,6 +390,9 @@ class AnalysisService:
         task_risk = Task(
             description=(
                 "Identify exactly 4 material risks using the analyst and valuation findings.\n\n"
+                "If a ticker is identifiable, call market_news to check for recent risk signals "
+                "and market_history (period='3mo') to assess volatility.\n"
+                "Use the calculator for ratio-based thresholds (D/E, current ratio, interest coverage).\n\n"
                 "For each risk:\n"
                 "• Category: FINANCIAL / OPERATIONAL / MARKET / REGULATORY\n"
                 "• Specific metric that signals this risk (exact number required)\n"
@@ -351,6 +438,14 @@ class AnalysisService:
                 '    "eps": "<exact figure>",\n'
                 '    "fcf": "<exact figure or NOT REPORTED>"\n'
                 '  },\n'
+                '  "chart_data": [\n'
+                '    /* Extract EVERY reporting period the document shows — quarters or years.\n'
+                '       Use search_documents to find the financial-highlights table.\n'
+                '       Numbers MUST be in the same unit (e.g. millions). Drop entries with no data.\n'
+                '       Each entry: */\n'
+                '    {"period": "Q1 2023", "revenue": <number>, "net_income": <number>,\n'
+                '     "operating_margin": <number>, "fcf": <number or null>}\n'
+                '  ],\n'
                 '  "catalyst": "<specific event to watch or N/A>",\n'
                 '  "summary": "<2 direct sentences: key deciding factor + action>"\n'
                 "}"
@@ -360,16 +455,167 @@ class AnalysisService:
             context=[task_verify, task_analyze, task_value, task_risk],
         )
 
+        # ── Planner: pick which agents are actually relevant ──────────────────
+        plan = self._plan(query)
+        agents_active = {
+            "verifier":  True,                      # always confirm the doc
+            "analyst":   "analyst"   in plan,
+            "valuation": "valuation" in plan,
+            "risk":      "risk"      in plan,
+            "advisor":   True,                      # always produce JSON
+        }
+        # Drop the dependency edges of skipped tasks so CrewAI doesn't choke
+        analyze_ctx = [task_verify]
+        value_ctx   = [task_analyze] if agents_active["analyst"] else [task_verify]
+        risk_ctx    = ([task_analyze] if agents_active["analyst"] else []) \
+                    + ([task_value]    if agents_active["valuation"] else [])
+        if not risk_ctx:
+            risk_ctx = [task_verify]
+        recommend_ctx = [task_verify]
+        if agents_active["analyst"]:   recommend_ctx.append(task_analyze)
+        if agents_active["valuation"]: recommend_ctx.append(task_value)
+        if agents_active["risk"]:      recommend_ctx.append(task_risk)
+
+        # Rebind contexts on the existing Task objects
+        task_analyze.context = analyze_ctx
+        task_value.context   = value_ctx
+        task_risk.context    = risk_ctx
+        task_recommend.context = recommend_ctx
+
+        active_agents: list[Agent] = [verifier]
+        active_tasks:  list[Task]  = [task_verify]
+        if agents_active["analyst"]:
+            active_agents.append(analyst);            active_tasks.append(task_analyze)
+        if agents_active["valuation"]:
+            active_agents.append(valuation_analyst);  active_tasks.append(task_value)
+        if agents_active["risk"]:
+            active_agents.append(risk_specialist);    active_tasks.append(task_risk)
+        active_agents.append(advisor)
+        active_tasks.append(task_recommend)
+
         # ── Assemble crew ─────────────────────────────────────────────────────
         crew = Crew(
-            agents=[verifier, analyst, valuation_analyst, risk_specialist, advisor],
-            tasks=[task_verify, task_analyze, task_value, task_risk, task_recommend],
+            agents=active_agents,
+            tasks=active_tasks,
             process=Process.sequential,
             verbose=False,
         )
 
         raw_result = self._kickoff_with_retry(crew)
-        return self._parse_result(raw_result)
+        result = self._parse_result(raw_result)
+
+        # ── Critic: validate JSON internal consistency, retry once if needed ─
+        result = self._critique_and_refine(result, query)
+        result["plan"] = sorted([k for k, v in agents_active.items() if v])
+        return result
+
+    # ── Planner ────────────────────────────────────────────────────────────────
+
+    def _plan(self, query: str) -> list[str]:
+        """Ask Groq which heavy agents this query actually needs. Returns a
+        list of agent keys: 'analyst', 'valuation', 'risk'. Falls back to
+        running all three on any error."""
+        all_agents = ["analyst", "valuation", "risk"]
+        try:
+            from groq import Groq
+            client = Groq(api_key=settings.GROQ_API_KEY)
+            resp = client.chat.completions.create(
+                model=settings.GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": (
+                        "You are a planner for a financial-analysis crew. Given a "
+                        "user query, decide which of these heavy agents are needed:\n"
+                        "  - analyst  : extracts numeric metrics from documents\n"
+                        "  - valuation: pulls live price/peers, computes multiples\n"
+                        "  - risk     : assesses risks, runs news/EDGAR lookups\n"
+                        "Output ONLY a JSON object: {\"agents\": [\"analyst\", ...]} "
+                        "Verifier and advisor always run, don't list them."
+                    )},
+                    {"role": "user", "content": f"Query: {query}"},
+                ],
+                response_format={"type": "json_object"},
+                max_tokens=80,
+                temperature=0.0,
+            )
+            content = resp.choices[0].message.content or "{}"
+            data = json.loads(content)
+            picked = [a for a in data.get("agents", []) if a in all_agents]
+            return picked or all_agents
+        except Exception:
+            return all_agents
+
+    # ── Critic ─────────────────────────────────────────────────────────────────
+
+    def _critic_check(self, result: Dict[str, Any]) -> list[str]:
+        """Return a list of contradictions in the advisor's JSON. Empty = OK."""
+        issues: list[str] = []
+        rec = (result.get("recommendation") or "").upper()
+        val = (result.get("valuation") or "").upper()
+        try:
+            risk = float(result.get("risk_score") or 0)
+        except Exception:
+            risk = 0.0
+        try:
+            conf = int(result.get("confidence_pct") or 0)
+        except Exception:
+            conf = 0
+
+        if rec == "BUY" and risk >= 8:
+            issues.append(f"BUY recommendation with risk_score={risk} (≥8) — high-risk BUY needs a stated catalyst justifying it.")
+        if rec == "BUY" and val == "OVERVALUED":
+            issues.append("BUY recommendation while valuation=OVERVALUED — these contradict.")
+        if rec == "SELL" and val == "UNDERVALUED":
+            issues.append("SELL recommendation while valuation=UNDERVALUED — these contradict.")
+        if rec == "SELL" and risk <= 3:
+            issues.append(f"SELL recommendation with risk_score={risk} (≤3) — low-risk SELL is unusual without a thesis.")
+        if conf >= 85 and not (result.get("reasons") and len(result["reasons"]) >= 3):
+            issues.append(f"confidence_pct={conf} is high but reasons[] has <3 entries.")
+        return issues
+
+    def _critique_and_refine(self, result: Dict[str, Any], query: str) -> Dict[str, Any]:
+        """If the critic finds contradictions, re-ask the advisor with the
+        critique inline. Single retry. Never raises."""
+        issues = self._critic_check(result)
+        if not issues:
+            result.setdefault("critic_status", "ok")
+            return result
+
+        try:
+            from groq import Groq
+            client = Groq(api_key=settings.GROQ_API_KEY)
+            resp = client.chat.completions.create(
+                model=settings.GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": (
+                        "You are a critic for a financial-analysis advisor. The "
+                        "user asks: " + query + "\n"
+                        "The advisor produced JSON that has internal contradictions. "
+                        "Resolve them and return ONLY the corrected JSON (same shape). "
+                        "Keep all metrics. Adjust ONLY the recommendation / valuation / "
+                        "confidence_pct / risk_score / summary / reasons to be self-consistent."
+                    )},
+                    {"role": "user", "content": (
+                        "Issues found:\n- " + "\n- ".join(issues)
+                        + "\n\nOriginal advisor JSON:\n" + json.dumps(result, default=str)
+                    )},
+                ],
+                response_format={"type": "json_object"},
+                max_tokens=1200,
+                temperature=0.1,
+            )
+            refined_raw = resp.choices[0].message.content or "{}"
+            refined = json.loads(refined_raw)
+            # Sanity: only accept the refinement if it kept the shape
+            if isinstance(refined, dict) and "recommendation" in refined:
+                refined["critic_status"] = "refined"
+                refined["critic_issues"] = issues
+                return refined
+        except Exception:
+            pass
+
+        result["critic_status"] = "issues_flagged_but_not_refined"
+        result["critic_issues"] = issues
+        return result
 
     # ── Retry on rate limit ───────────────────────────────────────────────────
 
@@ -394,20 +640,26 @@ class AnalysisService:
     # ── Result parsing ────────────────────────────────────────────────────────
 
     def _parse_result(self, raw: str) -> Dict[str, Any]:
+        parsed: Dict[str, Any] | None = None
         try:
             clean = raw.strip()
             if clean.startswith("```"):
                 clean = re.sub(r"```(?:json)?", "", clean).strip().rstrip("`").strip()
-            return json.loads(clean)
+            parsed = json.loads(clean)
         except Exception:
-            pass
-        try:
-            match = re.search(r"\{[\s\S]*\}", raw)
-            if match:
-                return json.loads(match.group())
-        except Exception:
-            pass
-        return self._fallback_parse(raw)
+            try:
+                match = re.search(r"\{[\s\S]*\}", raw)
+                if match:
+                    parsed = json.loads(match.group())
+            except Exception:
+                parsed = None
+
+        if parsed is None:
+            return self._fallback_parse(raw)
+
+        # Normalise chart_data — sanitize numbers, drop bad rows, sort if possible.
+        parsed["chart_data"] = _clean_chart_data(parsed.get("chart_data"))
+        return parsed
 
     def _fallback_parse(self, raw: str) -> Dict[str, Any]:
         rec = "HOLD"
@@ -428,6 +680,7 @@ class AnalysisService:
             "reasons": ["See summary for details"],
             "risks": ["Review full analysis for risk factors"],
             "metrics": {},
+            "chart_data": [],
             "catalyst": "N/A",
             "summary": raw[:500],
         }
@@ -442,6 +695,7 @@ class AnalysisService:
             "reasons": ["Analysis could not be completed"],
             "risks": [f"Error: {error[:200]}"],
             "metrics": {},
+            "chart_data": [],
             "catalyst": "N/A",
             "summary": f"Analysis failed: {error[:300]}",
         }

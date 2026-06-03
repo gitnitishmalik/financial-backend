@@ -1,21 +1,42 @@
 """
-rag_service.py  –  Lightweight RAG pipeline (no external vector DB required)
+rag_service.py  –  Lightweight RAG pipeline with on-disk persistence.
 
 Flow:
   1. Chunk documents into ~400-token passages
   2. Embed via EmbeddingService (shared all-MiniLM-L6-v2 — loaded only once)
   3. At query time: embed the query, cosine-rank chunks, return top-k
 
-Reusing EmbeddingService avoids loading the 80 MB model twice.
+Persistence:
+  - Each corpus is fingerprinted by sha256 of its sorted text contents.
+  - Chunks + embeddings are written to .rag_cache/<fingerprint>.npz so
+    they survive process restart AND are shared across services in-process
+    (two instances with the same corpus load the same npz).
 """
 
 from __future__ import annotations
 
+import hashlib
+import os
+from pathlib import Path
 from typing import List
 
 import numpy as np
 
 from services.embedding_service import EmbeddingService
+
+# ---------------------------------------------------------------------------
+# Persistence
+# ---------------------------------------------------------------------------
+CACHE_DIR = Path(os.getenv("RAG_CACHE_DIR", ".rag_cache"))
+CACHE_DIR.mkdir(exist_ok=True)
+
+
+def _fingerprint(texts: List[str]) -> str:
+    h = hashlib.sha256()
+    for t in sorted(t.strip() for t in texts if t and t.strip()):
+        h.update(t.encode("utf-8", errors="ignore"))
+        h.update(b"\x00")
+    return h.hexdigest()[:24]
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -77,25 +98,53 @@ class RAGService:
     # ------------------------------------------------------------------
 
     def ingest(self, texts: List[str]) -> None:
-        """Chunk and embed a list of raw document strings."""
+        """Chunk and embed a list of raw document strings.
+
+        Result is persisted to CACHE_DIR keyed by content fingerprint, so a
+        restart (or a sibling RAGService instance) skips the expensive
+        embed step entirely.
+        """
         self._chunks = []
         self._embeddings = None
         self._ready = False
 
-        for text in texts:
-            if text.strip():
-                self._chunks.extend(chunk_text(text))
+        clean_texts = [t for t in texts if t and t.strip()]
+        if not clean_texts:
+            return
+
+        # ── Try cache first ──────────────────────────────────────────────
+        fp = _fingerprint(clean_texts)
+        cache_path = CACHE_DIR / f"{fp}.npz"
+        if cache_path.exists():
+            try:
+                data = np.load(cache_path, allow_pickle=True)
+                self._chunks = list(data["chunks"])
+                self._embeddings = data["embeddings"]
+                self._ready = True
+                return
+            except Exception:
+                pass  # fall through to re-embed
+
+        for text in clean_texts:
+            self._chunks.extend(chunk_text(text))
 
         if not self._chunks:
             return
 
         try:
             self._embeddings = self._embedder.embed(self._chunks)
-            # Normalise for cosine similarity via dot product
             norms = np.linalg.norm(self._embeddings, axis=1, keepdims=True)
             norms = np.where(norms == 0, 1, norms)
             self._embeddings = self._embeddings / norms
             self._ready = True
+            try:
+                np.savez_compressed(
+                    cache_path,
+                    chunks=np.array(self._chunks, dtype=object),
+                    embeddings=self._embeddings,
+                )
+            except Exception:
+                pass  # cache write failure is not fatal
         except Exception:
             self._embeddings = None
 

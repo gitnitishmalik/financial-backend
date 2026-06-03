@@ -1,5 +1,4 @@
 import os
-import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -24,15 +23,19 @@ async def lifespan(app: FastAPI):
     print(f"  DB   : {settings.DATABASE_URL.split('///')[0]}")
     print(f"  Docs : /docs\n")
     yield
-    shutil.rmtree(UPLOAD_DIR, ignore_errors=True)
-    UPLOAD_DIR.mkdir(exist_ok=True)
+    # NB: don't wipe uploads on shutdown — DB rows reference these files
+    # and analysis would break after a restart.
 
 
 def get_allowed_origins() -> list[str]:
     origins = [
         "http://localhost:3000",
+        "http://localhost:3001",
+        "http://localhost:3002",
         "http://localhost:5173",
         "http://127.0.0.1:3000",
+        "http://127.0.0.1:3001",
+        "http://127.0.0.1:3002",
         "http://127.0.0.1:5173",
         "https://financial-analyst-ai-flax.vercel.app",
     ]

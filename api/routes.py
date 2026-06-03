@@ -1,6 +1,6 @@
 import uuid
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from fastapi.responses import StreamingResponse
@@ -9,7 +9,10 @@ from sqlalchemy import select
 from pydantic import BaseModel
 
 from core.config import settings
-from core.database import get_db, Document, Analysis, Alert
+from core.database import (
+    get_db, Document, Analysis, Alert, Notification,
+    ChatMessage, Memory, AsyncSessionLocal,
+)
 from services.analysis_service import AnalysisService   # ← was ai_service (bug fix)
 from services.market_service import MarketService
 from services.chat_service import ChatService
@@ -35,8 +38,8 @@ async def upload_documents(
 ):
     uploaded = []
     for file in files:
-        if not file.filename.lower().endswith((".pdf", ".xlsx", ".csv")):
-            raise HTTPException(400, f"{file.filename}: only PDF, XLSX, CSV allowed")
+        if not file.filename.lower().endswith((".pdf", ".xlsx", ".xls", ".csv")):
+            raise HTTPException(400, f"{file.filename}: only PDF, XLSX, XLS, CSV allowed")
 
         doc_id   = str(uuid.uuid4())
         safe_name = f"{doc_id}_{file.filename}"
@@ -163,6 +166,7 @@ class ChatRequest(BaseModel):
     message: str
     document_ids: List[str] = []
     session_id: str = "default"
+    user_id: str = "demo-user"
 
 
 @router.post("/chat")
@@ -177,12 +181,83 @@ async def chat_with_docs(req: ChatRequest, db: AsyncSession = Depends(get_db)):
 
     async def stream():
         async for chunk in chat_service.stream_response(
-            req.message, file_paths, req.session_id
+            req.message, file_paths, req.session_id, user_id=req.user_id,
         ):
             yield f"data: {chunk}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+@router.get("/chat/history/{session_id}")
+async def chat_history(session_id: str, db: AsyncSession = Depends(get_db)):
+    """Return all persisted turns for a session — used to rehydrate the FE."""
+    q = (
+        select(ChatMessage)
+        .where(ChatMessage.session_id == session_id)
+        .order_by(ChatMessage.created_at.asc())
+    )
+    rows = (await db.execute(q)).scalars().all()
+    return {"messages": [
+        {"role": r.role, "content": r.content, "created_at": str(r.created_at)}
+        for r in rows
+    ]}
+
+
+@router.delete("/chat/history/{session_id}")
+async def clear_chat_history(session_id: str, db: AsyncSession = Depends(get_db)):
+    from sqlalchemy import delete
+    await db.execute(delete(ChatMessage).where(ChatMessage.session_id == session_id))
+    await db.commit()
+    return {"cleared": session_id}
+
+
+# ─────────────────────────── Memory ──────────────────────────────
+
+class MemoryCreate(BaseModel):
+    user_id: str = "demo-user"
+    key: str
+    content: str
+    importance: int = 5
+
+
+@router.post("/memories")
+async def create_memory(mem: MemoryCreate, db: AsyncSession = Depends(get_db)):
+    record = Memory(
+        user_id=mem.user_id,
+        key=mem.key,
+        content=mem.content,
+        importance=max(1, min(10, mem.importance)),
+    )
+    db.add(record)
+    await db.commit()
+    return {"id": record.id, "key": record.key, "importance": record.importance}
+
+
+@router.get("/memories")
+async def list_memories(user_id: str = "demo-user", db: AsyncSession = Depends(get_db)):
+    q = (
+        select(Memory)
+        .where(Memory.user_id == user_id)
+        .order_by(Memory.importance.desc(), Memory.created_at.desc())
+    )
+    rows = (await db.execute(q)).scalars().all()
+    return {"memories": [
+        {"id": m.id, "key": m.key, "content": m.content,
+         "importance": m.importance, "created_at": str(m.created_at)}
+        for m in rows
+    ]}
+
+
+@router.delete("/memories/{mem_id}")
+async def delete_memory(mem_id: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Memory).where(Memory.id == mem_id))
+    mem = result.scalar_one_or_none()
+    if not mem:
+        raise HTTPException(404, "Memory not found")
+    await db.delete(mem)
+    await db.commit()
+    return {"deleted": mem_id}
 
 
 # ─────────────────────────── Market Data ─────────────────────────
@@ -216,6 +291,7 @@ class AlertCreate(BaseModel):
     condition: str      # "above" or "below"
     threshold: float
     user_id: str = "demo-user"
+    notify_email: Optional[str] = None
 
 
 @router.post("/alerts")
@@ -225,6 +301,7 @@ async def create_alert(alert: AlertCreate, db: AsyncSession = Depends(get_db)):
         ticker=alert.ticker.upper(),
         condition=alert.condition,
         threshold=alert.threshold,
+        notify_email=alert.notify_email,
     )
     db.add(record)
     await db.commit()
@@ -233,6 +310,7 @@ async def create_alert(alert: AlertCreate, db: AsyncSession = Depends(get_db)):
         "ticker": record.ticker,
         "condition": record.condition,
         "threshold": record.threshold,
+        "notify_email": record.notify_email,
     }
 
 
@@ -246,7 +324,12 @@ async def list_alerts(
     )
     alerts = result.scalars().all()
     return {"alerts": [
-        {"id": a.id, "ticker": a.ticker, "condition": a.condition, "threshold": a.threshold}
+        {
+            "id": a.id, "ticker": a.ticker, "condition": a.condition,
+            "threshold": a.threshold, "notify_email": a.notify_email,
+            "last_price": a.last_price,
+            "last_triggered_at": str(a.last_triggered_at) if a.last_triggered_at else None,
+        }
         for a in alerts
     ]}
 
@@ -260,3 +343,80 @@ async def delete_alert(alert_id: str, db: AsyncSession = Depends(get_db)):
     alert.active = 0
     await db.commit()
     return {"deleted": alert_id}
+
+
+# ─────────────────────────── Notifications ───────────────────────────
+
+@router.get("/notifications")
+async def list_notifications(
+    user_id: str = "demo-user",
+    unread_only: bool = False,
+    db: AsyncSession = Depends(get_db),
+):
+    q = select(Notification).where(Notification.user_id == user_id)
+    if unread_only:
+        q = q.where(Notification.read == 0)
+    q = q.order_by(Notification.created_at.desc()).limit(50)
+    result = await db.execute(q)
+    notifs = result.scalars().all()
+    return {"notifications": [
+        {
+            "id": n.id, "alert_id": n.alert_id, "ticker": n.ticker,
+            "condition": n.condition, "threshold": n.threshold,
+            "price": n.price, "message": n.message, "read": bool(n.read),
+            "created_at": str(n.created_at),
+        }
+        for n in notifs
+    ]}
+
+
+@router.post("/notifications/{notif_id}/read")
+async def mark_notification_read(notif_id: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(Notification).where(Notification.id == notif_id))
+    notif = result.scalar_one_or_none()
+    if not notif:
+        raise HTTPException(404, "Notification not found")
+    notif.read = 1
+    await db.commit()
+    return {"id": notif.id, "read": True}
+
+
+@router.get("/notifications/stream")
+async def notifications_stream(user_id: str = "demo-user"):
+    """SSE stream — pushes new Notification rows for this user as they appear.
+
+    3-second DB poll so it works without Redis pub/sub. The Celery alert
+    evaluator writes Notification rows; this endpoint sees them on the next
+    tick and pushes them down the wire.
+    """
+    import asyncio as _asyncio
+    import json as _json
+    from datetime import datetime as _dt
+
+    async def _stream():
+        last_seen: Optional[_dt] = _dt.utcnow()
+        yield f"data: {_json.dumps({'event': 'open', 'user_id': user_id})}\n\n"
+        while True:
+            async with AsyncSessionLocal() as session:
+                q = (
+                    select(Notification)
+                    .where(Notification.user_id == user_id, Notification.created_at > last_seen)
+                    .order_by(Notification.created_at.asc())
+                )
+                result = await session.execute(q)
+                new = result.scalars().all()
+            for n in new:
+                last_seen = n.created_at
+                payload = {
+                    "event": "alert",
+                    "id": n.id, "alert_id": n.alert_id,
+                    "ticker": n.ticker, "condition": n.condition,
+                    "threshold": n.threshold, "price": n.price,
+                    "message": n.message,
+                    "created_at": str(n.created_at),
+                }
+                yield f"data: {_json.dumps(payload)}\n\n"
+            yield ": keepalive\n\n"
+            await _asyncio.sleep(3)
+
+    return StreamingResponse(_stream(), media_type="text/event-stream")
